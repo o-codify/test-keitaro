@@ -108,16 +108,31 @@ def create_campaign(
     domain_id = data.domain_id or settings.default_domain_id
     group_id = data.group_id or settings.default_group_id
     source_id = data.traffic_source_id or settings.default_traffic_source_id
-    source_required = not source_id and bool(available_traffic_sources(client))
+    sources = available_traffic_sources(client)
     missing = [
         label
         for label, value in (("домен", domain_id), ("группу", group_id))
         if not value
     ]
-    if source_required:
+    if not source_id and sources:
         missing.append("источник")
     if missing:
         raise AppError(f"Выберите {', '.join(missing)}", status_code=422)
+
+    # Keitaro молча принимает несуществующие id (кампания получится без домена
+    # или с «висящим» источником), поэтому сверяем их со справочниками
+    unknown = [
+        f"{label} #{value}"
+        for label, value, items in (
+            ("домен", domain_id, client.list_domains()),
+            ("группа", group_id, client.list_campaign_groups()),
+            # без прав на источники список пустой — тогда проверить нечем
+            ("источник", source_id, sources if sources else None),
+        )
+        if value and items is not None and value not in {int(i["id"]) for i in items}
+    ]
+    if unknown:
+        raise AppError(f"Не найдено в Keitaro: {', '.join(unknown)}", status_code=422)
 
     try:
         name = apply_prefix(data.name, settings.campaign_prefix)

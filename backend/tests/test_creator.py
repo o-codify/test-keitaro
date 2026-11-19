@@ -86,3 +86,12 @@ def test_traffic_source_required_when_available(api, kt, monkeypatch):
     resp = api.post("/api/campaigns", json={"name": "nosource", "geo": "MX", "offer_id": 1})
     assert resp.status_code == 201, resp.text
     assert kt.get_campaign(resp.json()["id"])["traffic_source_id"] == 0
+
+
+def test_unknown_ids_rejected_before_creating(api, kt):
+    before = {c["id"] for c in kt.list_campaigns()}
+    for field, label in (("domain_id", "домен"), ("group_id", "группа"), ("traffic_source_id", "источник")):
+        resp = api.post("/api/campaigns", json={"name": "bad", "geo": "MX", "offer_id": 1, field: 999})
+        assert resp.status_code == 422, resp.text
+        assert f"{label} #999" in resp.json()["detail"]
+    assert {c["id"] for c in kt.list_campaigns()} == before
