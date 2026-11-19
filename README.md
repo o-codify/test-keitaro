@@ -27,12 +27,15 @@ backend/
     api.py               – HTTP-эндпоинты /api/*
     config.py            – настройки из .env (pydantic-settings)
     db.py, models.py     – SQLAlchemy: engine, сессии, модели
+    schemas.py           – Pydantic-схемы запросов и ответов
+    errors.py            – ошибка приложения (AppError)
     keitaro/             – клиент Keitaro: http_client.py (реальный), mock_client.py (в памяти)
     services/
       campaign_builder.py – создаватор кампаний
       editor.py           – редактор офферов: черновик, push, cancel, pin
       naming.py           – префикс, разбор гео, равномерное распределение весов
       offers.py           – кэш офферов для автокомплита
+      audit.py            – журнал действий
   alembic/               – миграции
   tests/                 – pytest
 frontend/                – React SPA
@@ -47,7 +50,7 @@ frontend/                – React SPA
 | `streams`       | Потоки кампаний (`has_offers` показывает, редактируется ли поток)             |
 | `stream_offers` | Привязки офферов к потокам: черновик (`status`, `share`, `pinned`) и опубликованное состояние (`published_status`, `published_share`) |
 | `offer_cache`   | Кэш справочника офферов для автокомплита (TTL задаётся в `.env`)              |
-| `audit_log`     | Журнал действий: create, fetch, add, remove, restore, pin, push, cancel       |
+| `audit_log`     | Журнал действий: create, fetch, add, remove, restore, pin, unpin, push, cancel |
 
 Поток считается неопубликованным («жёлтым»), если черновик хотя бы одной привязки отличается от опубликованного состояния.
 
@@ -58,7 +61,7 @@ frontend/                – React SPA
 ### 1. Настройки
 
 ```bash
-cp .env.example .env
+cp .env.example .env            # Windows (cmd): copy .env.example .env
 ```
 
 Все настройки берутся только из `.env`, в коде нет значений по умолчанию для бизнес-параметров. Обязательные параметры: `KEITARO_MOCK`, `CAMPAIGN_PREFIX`, `GEO_REDIRECT_URL`, а при `KEITARO_MOCK=false` ещё `KEITARO_URL` и `KEITARO_API_KEY`. Если чего-то не хватает, приложение не стартует и называет, что нужно задать. Значения по умолчанию есть только у технических параметров (таймаут, путь к SQLite, TTL кэша), они указаны в `.env.example`.
@@ -130,7 +133,7 @@ cd frontend && npm install && npm run build
 
 Для SQLite включён batch-режим (`render_as_batch`), поэтому `ALTER` колонок тоже работает.
 
-Чтобы перейти на PostgreSQL, нужно поставить драйвер (`pip install "psycopg[binary]"`), указать `DATABASE_URL=postgresql+psycopg://user:pass@host:5432/db` и выполнить `alembic upgrade head`.
+Чтобы перейти на PostgreSQL, нужно поставить драйвер (`pip install "psycopg[binary]"`), указать `DATABASE_URL=postgresql+psycopg://user:pass@host:5432/db` и выполнить `alembic upgrade head`. На PostgreSQL не проверялось, всё тестировалось на SQLite.
 
 ## Тесты
 
@@ -139,15 +142,17 @@ cd backend
 pytest
 ```
 
-Тесты используют mock-клиент и SQLite в памяти. Покрыты:
+28 тестов, используют mock-клиент и SQLite в памяти. Покрыты:
 - префикс, разбор гео и распределение весов;
-- создание кампании: параметры кампании, оба потока, откат при ошибке;
+- обязательные настройки: без них приложение не стартует;
+- создание кампании: параметры кампании, оба потока (`regular` и `default`), откат при ошибке, проверка id домена, группы и источника, источник обязателен, если доступен;
 - сценарии редактора из видео: add → 25×4 → push, cancel, remove → bring back, оффер удалён в Keitaro → removed после fetch, pin (38/37/25), проверка суммы 100% при push.
 
 ## API
 
 | Метод | Путь                                               | Что делает                                  |
 |-------|----------------------------------------------------|---------------------------------------------|
+| GET   | `/api/health`                                      | Проверка, что сервер жив                    |
 | GET   | `/api/dictionaries`                                | Домены, группы, источники, префикс, mock-режим |
 | GET   | `/api/offers?q=`                                   | Автокомплит офферов (по названию или ID)    |
 | POST  | `/api/offers/sync`                                 | Принудительно обновить кэш офферов          |
@@ -170,6 +175,7 @@ pytest
 | Действие                 | Запрос Keitaro Admin API                                         |
 |--------------------------|------------------------------------------------------------------|
 | Справочники              | `GET /domains`, `GET /groups?type=campaigns`, `GET /traffic_sources`, `GET /offers` |
+| Проверки перед созданием | `GET /offers/{id}`, а id домена, группы и источника сверяются со справочниками |
 | Создание кампании        | `POST /campaigns` (`alias` генерируется из имени, `type=position`, `cost_type=CPC`, `cost_auto=true`, `domain_id`, `group_id`, `traffic_source_id`) |
 | Поток #1                 | `POST /streams`: `type=regular`, `schema=redirect`, `action_type=http`, `action_payload=GEO_REDIRECT_URL`, `filters=[{name: country, mode: accept, payload: [...]}]` |
 | Поток #2                 | `POST /streams`: `type=default`, `schema=landings`, `offers=[{offer_id, share: 100, state: active}]` |
@@ -187,14 +193,15 @@ pytest
    curl -X POST http://localhost:8000/api/mock/streams/1002/offers/2/delete
    ```
    После **Fetch streams from KT** оффер станет `removed`, его можно вернуть кнопкой **Bring back**.
-5. Нажать 📌 у оффера с 25%, затем Remove или Bring back у другого: закреплённые 25% сохраняются, остальные веса пересчитываются.
+5. Кликнуть по проценту у оставшегося активного оффера и ввести 25: вес закрепится (📌). Затем **Bring back** у двух удалённых офферов → 38 / 37 / 25: закреплённые 25% не меняются, остальные делят 75%.
 
 ## Ограничения и заметки
 
 - Mock-Keitaro хранит данные в памяти и сбрасывается при перезапуске сервера, а локальная база остаётся. После перезапуска в mock-режиме лучше удалить `backend/app.db` и снова выполнить `alembic upgrade head`.
 - Fetch считает Keitaro источником истины: неопубликованные черновики потока при Fetch сбрасываются.
 - Закрепление веса — локальное свойство обёртки, в Keitaro уходят только итоговые `share`.
-- Всё проверено на живом трекере: создание кампании, оба потока, Fetch, Remove → Push (оффер убирается из потока в KT), Bring back → Push, откат через `DELETE /campaigns/{id}`, понятные ошибки на несуществующий оффер.
+- На живом трекере проверены: создание кампании с источником `FORTESTS`, оба потока, Fetch, Remove → Push (оффер убирается из потока в KT), Bring back → Push, откат через `DELETE /campaigns/{id}`, ошибки на несуществующие оффер, домен, группу и источник.
+- Сценарии с несколькими офферами (Add → 25×4, Cancel, Pin → 38/37/25) проверены только тестами и в mock-режиме: API-ключу на живом трекере доступен один оффер.
 - Keitaro требует `alias` при создании кампании (в документации поле необязательное). Обёртка генерирует его сама: `test_chalimov_x` → `test-chalimov-x-3f9a1c`.
 - **Источник трафика.** Когда источники доступны ключу, поле обязательно; на живом трекере проверено с источником `FORTESTS`. Если у ключа нет прав на источники (Keitaro отдаёт пустой список, а на запись отвечает 403), кампания создаётся без источника, и форма об этом предупреждает. ID можно задать вручную в `DEFAULT_TRAFFIC_SOURCE_ID`.
 - Keitaro молча принимает несуществующие `domain_id`, `group_id` и `traffic_source_id`. Поэтому перед созданием обёртка сверяет их со справочниками и отвечает 422: «Не найдено в Keitaro: источник #999».
